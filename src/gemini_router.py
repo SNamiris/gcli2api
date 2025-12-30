@@ -27,6 +27,7 @@ from .credential_manager import get_credential_manager
 from .gcli_chat_api import build_gemini_payload_from_native, send_gemini_request
 from .openai_transfer import _extract_content_and_reasoning
 from .task_manager import create_managed_task
+from .req_logger import log_incoming_request
 
 # 创建路由器
 router = APIRouter()
@@ -69,21 +70,21 @@ async def generate_content(
     api_key: str = Depends(authenticate_gemini_flexible),
 ):
     """处理Gemini格式的内容生成请求（非流式）"""
-    log.debug(f"Non-streaming request received for model: {model}")
-    log.debug(f"Request headers: {dict(request.headers)}")
-    log.debug(f"API key received: {api_key[:10] if api_key else None}...")
-    try:
-        body = await request.body()
-        log.debug(f"request body: {body.decode() if isinstance(body, bytes) else body}")
-    except Exception as e:
-        log.error(f"Failed to read request body: {e}")
-
     # 获取原始请求数据
     try:
         request_data = await request.json()
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="Gemini",
+        request=request,
+        api_key=api_key,
+        model=model,
+        body=request_data
+    )
 
     # 验证必要字段
     if "contents" not in request_data or not request_data["contents"]:
@@ -189,21 +190,21 @@ async def stream_generate_content(
     api_key: str = Depends(authenticate_gemini_flexible),
 ):
     """处理Gemini格式的流式内容生成请求"""
-    log.debug(f"Stream request received for model: {model}")
-    log.debug(f"Request headers: {dict(request.headers)}")
-    log.debug(f"API key received: {api_key[:10] if api_key else None}...")
-    try:
-        body = await request.body()
-        log.debug(f"request body: {body.decode() if isinstance(body, bytes) else body}")
-    except Exception as e:
-        log.error(f"Failed to read request body: {e}")
-
     # 获取原始请求数据
     try:
         request_data = await request.json()
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="Gemini Stream",
+        request=request,
+        api_key=api_key,
+        model=model,
+        body=request_data
+    )
 
     # 验证必要字段
     if "contents" not in request_data or not request_data["contents"]:

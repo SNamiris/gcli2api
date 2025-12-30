@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import get_anti_truncation_max_attempts
 from log import log
+from .req_logger import log_incoming_request
 from .utils import is_anti_truncation_model, authenticate_bearer, authenticate_gemini_flexible, authenticate_sdwebui_flexible, get_base_model_from_feature_model
 from .antigravity_api import (
     build_antigravity_request_body,
@@ -392,17 +393,17 @@ async def convert_antigravity_stream_to_openai(
         lines_generator: 行生成器 (已经过滤的 SSE 行)
     """
     state = {
-        "thinking_started": False,
+        "in_thinking": False,
         "tool_calls": [],
         "content_buffer": "",
-        "thinking_buffer": "",
+        "reasoning_buffer": "",
         "success_recorded": False
     }
 
     created = int(time.time())
 
     try:
-        def build_content_chunk(content: str) -> str:
+        def build_chunk(delta: dict) -> str:
             chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -410,21 +411,11 @@ async def convert_antigravity_stream_to_openai(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": content},
+                    "delta": delta,
                     "finish_reason": None
                 }]
             }
             return f"data: {json.dumps(chunk)}\n\n"
-
-        def flush_thinking_buffer() -> Optional[str]:
-            if not state["thinking_started"]:
-                return None
-            state["thinking_buffer"] += "\n</think>\n"
-            thinking_block = state["thinking_buffer"]
-            state["content_buffer"] += thinking_block
-            state["thinking_buffer"] = ""
-            state["thinking_started"] = False
-            return thinking_block
 
         async for line in lines_generator:
             if not line or not line.startswith("data: "):
@@ -446,67 +437,30 @@ async def convert_antigravity_stream_to_openai(
             parts = data.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
             for part in parts:
-                # 处理思考内容
+                # 处理思考内容 - 使用 reasoning_content 字段实时流式输出
                 if part.get("thought") is True:
-                    if not state["thinking_started"]:
-                        state["thinking_buffer"] = "<think>\n"
-                        state["thinking_started"] = True
-                    state["thinking_buffer"] += part.get("text", "")
+                    state["in_thinking"] = True
+                    thinking_text = part.get("text", "")
+                    if thinking_text:
+                        state["reasoning_buffer"] += thinking_text
+                        yield build_chunk({"reasoning_content": thinking_text})
 
                 # 处理图片数据 (inlineData)
                 elif "inlineData" in part:
-                    # 如果之前在思考，先结束思考
-                    thinking_block = flush_thinking_buffer()
-                    if thinking_block:
-                        yield build_content_chunk(thinking_block)
-
-                    # 提取图片数据
+                    state["in_thinking"] = False
                     inline_data = part["inlineData"]
                     mime_type = inline_data.get("mimeType", "image/png")
                     base64_data = inline_data.get("data", "")
-
-                    # 转换为 Markdown 格式的图片
                     image_markdown = f"\n\n![生成的图片](data:{mime_type};base64,{base64_data})\n\n"
                     state["content_buffer"] += image_markdown
-
-                    # 发送图片块
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": image_markdown},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield build_chunk({"content": image_markdown})
 
                 # 处理普通文本
                 elif "text" in part:
-                    # 如果之前在思考，先结束思考
-                    thinking_block = flush_thinking_buffer()
-                    if thinking_block:
-                        yield build_content_chunk(thinking_block)
-
-                    # 添加文本内容
+                    state["in_thinking"] = False
                     text = part.get("text", "")
                     state["content_buffer"] += text
-
-                    # 发送文本块
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": text},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield build_chunk({"content": text})
 
                 # 处理工具调用
                 elif "functionCall" in part:
@@ -518,24 +472,9 @@ async def convert_antigravity_stream_to_openai(
             # 检查是否结束
             finish_reason = data.get("response", {}).get("candidates", [{}])[0].get("finishReason")
             if finish_reason:
-                thinking_block = flush_thinking_buffer()
-                if thinking_block:
-                    yield build_content_chunk(thinking_block)
-
                 # 发送工具调用
                 if state["tool_calls"]:
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"tool_calls": state["tool_calls"]},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield build_chunk({"tool_calls": state["tool_calls"]})
 
                 # 发送使用统计
                 usage_metadata = data.get("response", {}).get("usageMetadata", {})
@@ -603,13 +542,13 @@ def convert_antigravity_response_to_openai(
     parts = response_data.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
     content = ""
-    thinking_content = ""
+    reasoning_content = ""
     tool_calls_list = []
 
     for part in parts:
-        # 处理思考内容
+        # 处理思考内容 - 使用 reasoning_content 字段
         if part.get("thought") is True:
-            thinking_content += part.get("text", "")
+            reasoning_content += part.get("text", "")
 
         # 处理图片数据 (inlineData)
         elif "inlineData" in part:
@@ -627,14 +566,11 @@ def convert_antigravity_response_to_openai(
         elif "functionCall" in part:
             tool_calls_list.append(convert_to_openai_tool_call(part["functionCall"]))
 
-    # 拼接思考内容
-    if thinking_content:
-        content = f"<think>\n{thinking_content}\n</think>\n{content}"
-
     # 使用 OpenAIChatMessage 模型构建消息
     message = OpenAIChatMessage(
         role="assistant",
         content=content,
+        reasoning_content=reasoning_content if reasoning_content else None,
         tool_calls=tool_calls_list if tool_calls_list else None
     )
 
@@ -797,6 +733,15 @@ async def chat_completions(
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="Antigravity",
+        request=request,
+        api_key=token,
+        model=raw_data.get("model"),
+        body=raw_data
+    )
 
     # 创建请求对象
     try:
@@ -1036,6 +981,15 @@ async def gemini_generate_content(
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="Antigravity Gemini",
+        request=request,
+        api_key=api_key,
+        model=model,
+        body=request_data
+    )
+
     # 验证必要字段
     if "contents" not in request_data or not request_data["contents"]:
         raise HTTPException(status_code=400, detail="Missing required field: contents")
@@ -1167,6 +1121,15 @@ async def gemini_stream_generate_content(
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="Antigravity Gemini Stream",
+        request=request,
+        api_key=api_key,
+        model=model,
+        body=request_data
+    )
 
     # 验证必要字段
     if "contents" not in request_data or not request_data["contents"]:
@@ -1356,7 +1319,7 @@ async def sdwebui_list_models(_: str = Depends(authenticate_sdwebui_flexible)):
 
 @router.post("/sdapi/v1/txt2img")
 @router.post("/antigravity/sdapi/v1/txt2img")
-async def sdwebui_txt2img(request: Request, _: str = Depends(authenticate_sdwebui_flexible)):
+async def sdwebui_txt2img(request: Request, auth: str = Depends(authenticate_sdwebui_flexible)):
     """处理 SD-WebUI 格式的 txt2img 请求，转换为 Antigravity API"""
     # 获取原始请求数据
     try:
@@ -1364,6 +1327,15 @@ async def sdwebui_txt2img(request: Request, _: str = Depends(authenticate_sdwebu
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="Antigravity SDWebUI",
+        request=request,
+        api_key=auth,
+        model=request_data.get("override_settings", {}).get("sd_model_checkpoint"),
+        body=request_data
+    )
 
     # 提取基本参数
     prompt = request_data.get("prompt", "")

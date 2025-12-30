@@ -34,6 +34,7 @@ from .openai_transfer import (
     openai_request_to_gemini_payload,
 )
 from .task_manager import create_managed_task
+from .req_logger import log_incoming_request
 
 # 创建路由器
 router = APIRouter()
@@ -70,6 +71,15 @@ async def chat_completions(
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    # 统一记录请求日志
+    await log_incoming_request(
+        router_name="OpenAI",
+        request=request,
+        api_key=token,
+        model=raw_data.get("model"),
+        body=raw_data
+    )
 
     # 创建请求对象
     try:
