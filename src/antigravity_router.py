@@ -161,7 +161,21 @@ def openai_messages_to_antigravity_contents(messages: List[Any]) -> List[Dict[st
             if content:
                 extracted = extract_images_from_content(content)
                 if extracted["text"]:
-                    parts.append({"text": extracted["text"]})
+                    # 解析 <think> 标签以保留思考内容
+                    import re
+                    text_content = extracted["text"]
+                    think_match = re.match(r"^<think>(.*?)</think>(.*)$", text_content, re.DOTALL)
+                    
+                    if think_match:
+                        thought_text = think_match.group(1).strip()
+                        remaining_text = think_match.group(2).strip()
+                        
+                        if thought_text:
+                            parts.append({"text": thought_text, "thought": True})
+                        if remaining_text:
+                            parts.append({"text": remaining_text})
+                    else:
+                        parts.append({"text": text_content})
 
             # 添加工具调用
             if tool_calls:
@@ -823,6 +837,35 @@ async def chat_completions(
     # 模型名称映射
     actual_model = model_mapping(model)
     enable_thinking = is_thinking_model(model)
+
+    # [Fix] 检查历史消息是否符合 thinking 启用条件
+    # Anthropic 要求: "When 'thinking' is enabled, a final 'assistant' message must start with a thinking block (preceeding the lastmost set of 'tool_use' blocks)"
+    # 如果历史中最后的 assistant 消息包含 tool_calls 但没有 thinking block (通常是因为之前被 strip 了)，我们需要禁用 thinking 以避免 400 错误
+    if enable_thinking and messages:
+        last_assistant_msg = None
+        for msg in reversed(messages):
+            if getattr(msg, "role", None) == "assistant":
+                last_assistant_msg = msg
+                break
+        
+        if last_assistant_msg:
+            # 检查是否有工具调用
+            tool_calls = getattr(last_assistant_msg, "tool_calls", None)
+            has_tool_calls = bool(tool_calls)
+            
+            # 检查是否有思考内容
+            has_thinking = False
+            content = getattr(last_assistant_msg, "content", "")
+            if content:
+                extracted = extract_images_from_content(content)
+                # 检查是否以 <think> 开头
+                if extracted["text"] and extracted["text"].strip().startswith("<think>"):
+                    has_thinking = True
+            
+            # 如果有工具调用但没有思考内容，必须禁用 thinking
+            if has_tool_calls and not has_thinking:
+                log.info(f"[ANTIGRAVITY] Disabling thinking for model {model} because last assistant message has tool calls but no thinking block (avoids API 400 error).")
+                enable_thinking = False
 
     log.info(f"[ANTIGRAVITY] Request: model={model} -> {actual_model}, stream={stream}, thinking={enable_thinking}, anti_truncation={use_anti_truncation}")
 
